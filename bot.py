@@ -1,20 +1,24 @@
-import sys, string, re
+import sys, string, re, threading
 import aiml
-from time import time
+from time import time, sleep
 from irc import irc
 
 class bot():
 
-	def __init__(self, host, port, nick, channels = [], chatlevel = 1):
+	def __init__(self, host, port, nick, channels = [], chatlevel = 1, responsedelay = 0.3):
 		self.host = host
 		self.port = port
 		self.nick = nick
 		self.channels = channels
+		self.buffer = []
 		self.chatlevel = chatlevel
+		self.succinct = False
+		self.listening = True
 		self.AI = aiml.Kernel()
 		self.IRC = irc(self.host,self.port,self.nick)
 		self.listen = []
 		self.prevsender = ""
+		self.responsedelay = responsedelay
 		
 	def connect(self):
 		self.IRC.connect()
@@ -49,6 +53,10 @@ class bot():
 			response = response[limit:]
 		
 	def send_response(self, receiver, response):
+		if self.succinct:
+			response = re.split("([.?!])(.)*", response)
+			response = response[0] + response[1]
+		print response
 		response = list(self.split_response(response, 400))
 		for chunk in response:
 			self.IRC.send(receiver,chunk)
@@ -66,6 +74,18 @@ class bot():
 					except:
 						pass
 					response = response + "My chatlevel is " + str(self.chatlevel) + ". "
+				elif command[0] == "responsedelay":
+					try:
+						self.responsedelay = float(command[1])
+					except:
+						pass
+					response = response + "My response delay is " + str(self.responsedelay) + ". "
+				elif command[0] == "succinct":
+					if self.succinct:
+						self.succinct = False
+					else:
+						self.succinct = True
+					response = response + "My succinct option is " + str(self.succinct) + ". "
 				elif command[0] == "join":
 					for i in range(1, len(command)):
 						if command[i] not in self.channels:
@@ -97,56 +117,70 @@ class bot():
 							response = response + "I will not listen to " + command[i] + " as much. "
 				elif command[0] == "listenlist":
 					response = response + "I am listening to: " + " ".join(self.listen) + ". "
+				elif command[0] == "listening":
+					if self.listening:
+						self.listening = False
+					else:
+						self.listening = True
+					response = response + "My listening option is " + str(self.listening) + ". "
 		if response == "":
 			response = "I'm sorry but I don't understand your command. "
 		return response
-
-	def run(self):
-		end_time = time() + 1
-		while time() < end_time:
-			buffer = self.IRC.get_data()
-			print buffer
 		
+	def handle_buffer(self):
 		while(True):
-			buffer = self.IRC.get_data()
-			print buffer
-			msg = string.split(buffer)
+			input = self.IRC.get_data()
+			print input
+			msg = string.split(input)
 			if msg[0] == "PING":
 				self.IRC.ping_pong(msg[1])
 				self.listen = []
+				self.prevsender = ""
 			else:
 				try:
-					# Message = ["Sender name" "Sender host" "Action" "Receiver" "Text"]
-					message = self.IRC.get_message(buffer)
+					# Message = ["Sender name", "Sender host", "Action", "Receiver", "Text"]
+					message = self.IRC.get_message(input)
 					response = ""
-					if self.nick == message[0]:
-						pass
-					else:
-						sender = message[0]
-						receiver = self.determine_receiver(sender, message[3])
-						self.AI.respond("set name " + sender)
-						if self.nick + ":cmd" in message[4]:
-							response = self.handle_command(message)
-							self.send_response(receiver, response)
-						elif self.chatlevel < 1:
-							pass
-						elif self.nick in message[3]:
-							response = self.AI.respond(self.remove_nick(message[4]))
-							self.send_response(receiver, response)
-						elif message[3] in self.channels:
-							if self.chatlevel > 1:
-								response = self.AI.respond(self.remove_nick(message[4]))
-								self.send_response(receiver, response)
-							elif self.nick in message[4]:
-								if sender == self.prevsender:
-									if sender not in self.listen:
-										self.listen.append(sender)
-								self.prevsender = sender
-								response = self.AI.respond(self.remove_nick(message[4]))
-								self.send_response(receiver, response)
-							elif sender in self.listen:
-								response = self.AI.respond(self.remove_nick(message[4]))
-								self.send_response(receiver, response)
-					print response
+					sender = message[0]
+					receiver = self.determine_receiver(sender, message[3])
+					if self.nick + ":cmd" in message[4]:
+						response = self.handle_command(message)
+						self.IRC.send(receiver, response)
+					elif self.nick != sender:
+						self.buffer.append(message)
 				except:
+					print "Aborted previous operation due to error.\n"
+
+	def run(self):
+		thread1 = threading.Thread(target = self.handle_buffer)
+		thread1.start()
+		sleep(2)
+		self.buffer = []
+		
+		while(True):
+			sleep(self.responsedelay)
+			for message in self.buffer:
+				response = ""
+				sender = message[0]
+				receiver = self.determine_receiver(sender, message[3])
+				self.AI.respond("set name " + sender)
+				if self.chatlevel < 1:
 					pass
+				elif self.nick in message[3]:
+					response = self.AI.respond(self.remove_nick(message[4]))
+					self.send_response(receiver, response)
+				elif message[3] in self.channels:
+					if self.chatlevel > 1:
+						response = self.AI.respond(self.remove_nick(message[4]))
+						self.send_response(receiver, response)
+					elif self.nick in message[4]:
+						if self.listening and sender == self.prevsender:
+							if sender not in self.listen:
+								self.listen.append(sender)
+						self.prevsender = sender
+						response = self.AI.respond(self.remove_nick(message[4]))
+						self.send_response(receiver, response)
+					elif sender in self.listen:
+						response = self.AI.respond(self.remove_nick(message[4]))
+						self.send_response(receiver, response)
+				self.buffer.remove(message)
